@@ -1,0 +1,708 @@
+
+
+//////////////////////////////////////////////////////////////////////////////////
+// Company: 
+// Engineer: 
+// 
+// Create Date: 03.06.2024 20:29:07
+// Design Name: 
+// Module Name: SerialDacv2
+// Project Name: 
+// Target Devices: 
+// Tool Versions: 
+// Description: 
+// 
+// Dependencies: 
+// 
+// Revision:
+// Revision 0.01 - File Created
+// Additional Comments:
+// 
+//////////////////////////////////////////////////////////////////////////////////
+`timescale 1ns / 10ps
+
+module SerialDac (
+    input data_ready_i,
+    input [15:0] DAC_data,
+   
+    input sysclk,
+    input reset,
+    input sysclk_spi,
+    output reg CS_out,
+    output spi_clk,
+    output serial_data_out_0_port,  //SDI
+    output serial_data_out_1_port,
+    output reg ldac_port,
+    output reg reset_DAC
+);
+  reg ldac, ldac_S;
+  reg [31:0] r_reset_counter;
+  reg r_reset_done = 0;
+  reg [2:0] clk_240_prescaler_timer = 0;
+  reg INIT_DAC_DONE = 0;
+  reg [15:0] bit_counter = 0;  // Bit counter for serialization
+  reg [15:0] bit_counter_data = 0;
+  reg [15:0] bit_counter_data_stream = 0;
+  reg VREF_SETTING_DONE = 0;
+  reg PRECSION_MODE_SETTING_DONE = 0;
+  
+  
+  reg CS_d;
+  reg CS, CS_S;
+  reg serial_data_out_0 = 1'b0;
+  reg serial_data_out_1 = 1'b0;
+  reg [3:0] wait_c = 4'd0;
+  reg serial_data_out_0_S = 1'b0;
+  reg serial_data_out_1_S = 1'b0;
+
+  reg [15:0] counter = 16'd1;
+  reg ST_Sel = 1'b0;
+  reg update_d = 1'b1;
+  
+  initial begin
+    r_reset_counter = 32'd0;
+    r_reset_done = 1'b0;
+  end
+
+  assign spi_clk = sysclk_spi;
+
+
+  initial begin
+    INIT_DAC_DONE = 1'b0;
+  end
+  // States for Master State Machine
+  localparam IDLE = 0, INIT_DAC = 1, CHECK_STATUS = 2, READY = 3, STREAM_DATA = 4;
+
+  // States for INIT_DAC State machine
+  localparam SET_CONFIG_A =51,SET_CONFIG_B =12, SET_CONFIG_C =13,  SET_CONFIG_D =14, SET_VREF = 15, SET_PRECSION =16,SET_OUTPUT_RANGE=17,
+    INIT_COMPLETED=18, SET_CONFIG_TX = 19, SET_HW_LDAC_FST =31, SET_HW_LDAC_PSC= 32, SET_ERR_MASK=33, SET_STREAM_MODE_LENGTH= 34, SET_TX_DSPI = 35, SET_DDR =36, SET_STREAM_MODE=37, SET_LDAC_MASK_MODE =38;
+
+  // States for INIT DAC Check
+  localparam CHECK_CONFIG_Az=21,CHECK_CONFIG_Bz=22, CHECK_CONFIG_Cz=23, CHECK_CONFIG_Dz=24,VREF_CHECKz=25, OUTPUT_RANGE_CHECKz=26, CHECK_CONFIG_TXz=27, CHECK_COMPLETED =28;
+  localparam start_stream = 7, stay = 8, deassert_ldac = 9, DAC_stable = 10, delay = 11;
+  // Temporary DAC Data
+  //reg [15:0] DAC_data = 16'd0;
+  reg [23:0] DAC_dataPRC = 24'b000000000000000000000000;
+  // Commands required for DAC Configuration
+  localparam INTERFACE_CONFIG_A = {
+    1'b0, 7'h00, 8'b00000000
+  };  // { Write, INTERFACE CONFIG A REGISTER Address, address decrementing, and all set to 0 }
+  localparam INTERFACE_CONFIG_B = {
+    1'b0, 7'h01, 8'b10001000
+  };  // { Write, INTERFACE CONFIG B REGISTER Address, Single Instruction Mode, 7 bit addressing mode }
+  localparam INTERFACE_CONFIG_B_STREAM = {1'b0, 7'h01, 8'b00001000};  //Set Stream bit
+  localparam INTERFACE_CONFIG_TX = {
+    1'b0, 7'h0F, 8'b00000100
+  };  // { Write, Transfer Configuration Register, Set to SINGLE SPI}
+  localparam INTERFACE_STREAM_MODE = {
+    1'b0, 7'h0E, 8'b00000010
+  };  //{Write, STream Mode Register Address, Set to 2 registers/bytes}
+  localparam INTERFACE_CONFIG_TX_DSPI = {
+    1'b0, 7'h0F, 8'b01000100
+  };  // { Write, Transfer Configuration Register, Set to SINGLE SPI}
+  localparam INTERFACE_CONFIG_C = {
+    1'b0, 7'h10, 8'b00100011
+  };  // { Write, INTERFACE CONFIG C REGISTER Address, CRC Disabled, strict register access (read-only at 1)}
+  localparam INTERFACE_CONFIG_D = {
+    1'b0, 7'h14, 8'b00001100
+  };  // { Write, INTERFACE CONFIG D REGISTER Address, Memory CRC disabled, SDIO drive set to medium, DDR disabled* }
+  localparam INTERFACE_CONFIG_D_DDR = {1'b0, 7'h14, 8'b00001101};
+  ////////
+  localparam INTERFACE_CONFIG_D_D0 = {1'b0, 7'h14, 4'b0011};  // Set DDR Mode
+  localparam INTERFACE_CONFIG_D_D1 = {1'b0, 7'b0000000, 4'b0010};
+  ////////
+
+
+  localparam VREF_INIT_COMMAND = {
+    1'b0, 7'h15, 8'b00000001
+  };  // { Write, REFERENCE CONFIG REGISTER Address, Data set to use 2.5v }
+  localparam ERR_ALARM_MASK_CONFIG = {1'b0, 7'h16, 8'b01111111};  // All Plags set to off
+  localparam OUTPUT_RANGE_CONFIG = {
+    1'b0, 7'h19, 8'b00000011
+  };  // { Write, OUTPUT RANGE CONFIG ADDRESS, Set to 0v to 2.5v }
+  //localparam PRECSION_INIT_COMMAND =16'b011111011011111;   // {}
+  localparam HW_LDAC_SETTING_FST = {
+    1'b0, 7'h28, 8'b00000000
+  };  // { Write, DAC is updated when LDAC is asseted for fast mode}
+
+  localparam HW_LDAC_SETTING_FST_Masked = {
+    1'b0, 7'h28, 8'b00000001
+  };  // { Write, DAC is updated when LDAC is asseted for fast mode}
+
+  localparam HW_LDAC_SETTING_FST_Masked_SDIO_0 = {1'b0, 7'h28, 4'b0000};
+  localparam HW_LDAC_SETTING_FST_Masked_SDIO_1 = {1'b0, 7'h00, 4'b0000};
+
+  localparam HW_LDAC_SETTING_PSC = {
+    1'b0, 7'h37, 8'b00000000
+  };  // { Write, DAC is updated when LDAC is asseted for precision mode}
+
+  // Commands required for Config check
+
+  localparam CHECK_CONFIG_A = {
+    1'b1, 7'h00, 8'b00000000
+  };  // { Read, INTERFACE CONFIG A REGISTER Address, address decrementing, and all set to 0 }
+  localparam CHECK_CONFIG_B = {
+    1'b1, 7'h01, 8'b10001000
+  };  // { Read, INTERFACE CONFIG B REGISTER Address, Single Instruction Mode, 15 bit addressing mode }
+  localparam CHECK_CONFIG_B_STREAM = {1'b1, 7'h01, 8'b00001000};
+
+  localparam CHECK_CONFIG_C = {
+    1'b1, 7'h10, 8'b00100011
+  };  // { Read, INTERFACE CONFIG C REGISTER Address, CRC Disabled, strict register access (read-only at 1)}
+  localparam CHECK_CONFIG_D = {
+    1'b1, 7'h14, 8'b00001000
+  };  // { Read, INTERFACE CONFIG D REGISTER Address, Memory CRC disabled, SDIO drive set to medium high, DDR disabled* }
+  localparam VREF_CHECK = {
+    1'b1, 7'h15, 8'b00000001
+  };  // { Read, REFERENCE CONFIG REGISTER Address, Data set to use 2.5v }
+  localparam OUTPUT_RANGE_CHECK = {
+    1'b1, 7'h19, 8'b00000011
+  };  // { Read, OUTPUT RANGE CONFIG ADDRESS, Set to 0v to 2.5v }
+  localparam INTERFACE_CHECK_TX = {
+    1'b1, 7'h0F, 8'b00000000
+  };  // { Read, Transfer Configuration Register, Set to SINGLE SPI }
+
+  // DAC DATA Transaction
+
+  wire [23:0] DAC_DATA_FRAME;
+  wire [15:0] DUAL_CHECK_FRAME1, DUAL_CHECK_FRAME2;
+  reg [7:0] DAC_EVEN = 8'b00000000;
+  reg [7:0] DAC_ODD = 8'b00000000;
+  reg [16:0] DAC_EVEN_Stream = 16'b0000000000000000, DAC_ODD_Stream = 16'b1010101010101010;
+  wire [15:0] DDR_CHECK_FRAME1, DDR_CHECK_FRAME2;
+  reg [15:0] waveCounter = 16'd0;
+
+
+
+
+
+  reg [15:0] data_in = 16'd0;
+
+  always @(update_d , data_ready_i) begin
+
+    data_in = DAC_data;  /// Assign DDS input to data_in here.
+
+  end
+
+
+
+
+
+
+
+
+  wire [7:0] Frame_1buf, Frame_2buf;
+
+  genvar i;
+
+  assign DDR_CHECK_FRAME1 = {1'b0, 7'h2A, Frame_1buf};
+  assign DDR_CHECK_FRAME2 = {1'b0, 7'b0000000, Frame_2buf};
+
+  generate
+    for (i = 0; i < 8; i = i + 1) begin
+     
+      assign Frame_1buf[i] = data_in[2*i];
+      assign Frame_2buf[i] = data_in[2*i+1];
+    
+    end
+  endgenerate
+
+
+
+
+
+
+
+  /////////////////////////////// 
+
+
+  reg [2:0] state = IDLE, next_state = IDLE;
+  reg [5:0] INIT_STATE = SET_CONFIG_A;
+  reg [5:0] CHECK_CONFIG_STATE = CHECK_CONFIG_Az;
+
+  // Clock Stabilization
+  always @(posedge sysclk_spi) begin  // always @(posedge clk_240) begin
+    r_reset_counter <= r_reset_counter + 1;
+    if (r_reset_counter == 32'b0000_0000_1111_1111_1111_1111_1111_1111) begin
+      r_reset_done <= 1'b1;
+    end
+  end
+
+
+  // Main state machine handling SPI communication
+  always @(negedge sysclk_spi or posedge reset) begin
+    if (reset) begin
+      state <= IDLE;
+      CS <= 1;  // Deassert CS
+      reset_DAC <= 1;  // Assert DAC reset
+      ldac <= 1;  // Assert LDAC
+      bit_counter <= 0;
+    end else begin
+
+      case (state)
+        IDLE: if (r_reset_done) state <= INIT_DAC;
+        INIT_DAC: begin
+          ST_Sel = 1'b0;
+          case (INIT_STATE)
+
+            SET_CONFIG_A: begin
+
+
+              CS <= 0;  // Assert SPI Chip Select
+              if (bit_counter < 16) begin
+                if (!CS) begin
+                  serial_data_out_0 <= INTERFACE_CONFIG_A[15-bit_counter];  // Shift out MSB first
+                  bit_counter <= bit_counter + 1;
+
+                end
+
+
+              end else begin
+                bit_counter <= 0;
+                CS <= 1;
+                // ldac <= 0; // Pulse LDAC low to update DAC output
+                ldac <= 0;
+                //                                    if(ldac==0)begin
+                //                                    ldac = 1;
+
+                INIT_STATE = SET_CONFIG_B;
+              end
+            end
+            // end   
+
+            SET_CONFIG_B: begin
+              ldac <= 1;
+              CS   <= 0;  // Assert SPI Chip Select
+              if (bit_counter < 16) begin
+                if (!CS) begin
+                  serial_data_out_0 = INTERFACE_CONFIG_B[15-bit_counter];  // Shift out MSB first
+                  bit_counter = bit_counter + 1;
+
+                end
+              end else begin
+                bit_counter <= 0;
+
+                CS <= 1;
+                ldac <= 0;
+
+                INIT_STATE <= SET_CONFIG_TX;
+
+              end
+            end
+
+            SET_CONFIG_TX: begin
+
+              CS   <= 0;
+              ldac <= 1;  // Assert SPI Chip Select
+              if (bit_counter < 16) begin
+                if (!CS) begin
+                  serial_data_out_0 = INTERFACE_CONFIG_TX[15-bit_counter];  // Shift out MSB first
+                  bit_counter = bit_counter + 1;
+
+                end
+              end else begin
+                bit_counter <= 0;
+                ldac <= 0;  // Pulse LDAC low to update DAC output
+                CS <= 1;
+                //ldac <= 1;
+                INIT_STATE <= SET_STREAM_MODE_LENGTH;
+
+              end
+            end
+
+            SET_STREAM_MODE_LENGTH: begin
+
+              CS   <= 0;
+              ldac <= 1;  // Assert SPI Chip Select
+              if (bit_counter < 16) begin
+                if (!CS) begin
+                  serial_data_out_0 = INTERFACE_STREAM_MODE[15-bit_counter];  // Shift out MSB first
+                  bit_counter = bit_counter + 1;
+
+                end
+              end else begin
+                bit_counter <= 0;
+                ldac <= 0;  // Pulse LDAC low to update DAC output
+                CS <= 1;
+                //ldac <= 1;
+                INIT_STATE <= SET_CONFIG_C;
+
+              end
+            end
+
+
+            SET_CONFIG_C: begin
+
+              CS   <= 0;  // Assert SPI Chip Select
+              ldac <= 1;
+              if (bit_counter < 16) begin
+                if (!CS) begin
+                  serial_data_out_0 = INTERFACE_CONFIG_C[15-bit_counter];  // Shift out MSB first
+                  bit_counter = bit_counter + 1;
+
+                end
+              end else begin
+                bit_counter <= 0;
+
+                CS <= 1;
+                ldac <= 0;
+                INIT_STATE <= SET_CONFIG_D;
+
+              end
+            end
+
+            SET_CONFIG_D: begin
+
+              CS   <= 0;  // Assert SPI Chip Select
+              ldac <= 1;
+              if (bit_counter < 16) begin
+                if (!CS) begin
+                  serial_data_out_0 = INTERFACE_CONFIG_D[15-bit_counter];  // Shift out MSB first
+                  bit_counter = bit_counter + 1;
+
+                end
+              end else begin
+                bit_counter <= 0;
+                //ldac <= 0; // Pulse LDAC low to update DAC output
+                CS <= 1;
+                ldac <= 0;
+                INIT_STATE <= SET_VREF;
+
+              end
+            end
+
+            SET_VREF: begin
+
+              CS   <= 0;  // Assert SPI Chip Select
+              ldac <= 1;
+              if (bit_counter < 16) begin
+                if (!CS) begin
+                  serial_data_out_0 = VREF_INIT_COMMAND[15-bit_counter];  // Shift out MSB first
+                  bit_counter = bit_counter + 1;
+
+                end
+              end else begin
+                bit_counter <= 0;
+
+                CS <= 1;
+                ldac <= 0;
+                INIT_STATE <= SET_ERR_MASK;
+
+              end
+            end
+
+
+
+            SET_ERR_MASK: begin
+
+              CS   <= 0;  // Assert SPI Chip Select
+              ldac <= 1;
+              if (bit_counter < 16) begin
+                if (!CS) begin
+                  serial_data_out_0 = ERR_ALARM_MASK_CONFIG[15-bit_counter];  // Shift out MSB first
+                  bit_counter = bit_counter + 1;
+
+                end
+              end else begin
+                bit_counter <= 0;
+
+                CS <= 1;
+                ldac <= 0;
+                INIT_STATE <= SET_OUTPUT_RANGE;
+
+              end
+            end
+
+            SET_OUTPUT_RANGE: begin
+
+              CS   <= 0;  // Assert SPI Chip Select
+              ldac <= 1;
+              if (bit_counter < 16) begin
+                if (!CS) begin
+                  serial_data_out_0 = OUTPUT_RANGE_CONFIG[15-bit_counter];  // Shift out MSB first
+                  bit_counter = bit_counter + 1;
+
+                end
+              end else begin
+                bit_counter <= 0;
+
+                CS <= 1;
+                ldac <= 0;
+                INIT_STATE <= SET_HW_LDAC_FST;
+
+              end
+            end
+
+            SET_HW_LDAC_FST: begin
+
+              CS   <= 0;  // Assert SPI Chip Select
+              ldac <= 1;
+              if (bit_counter < 16) begin
+                if (!CS) begin
+                  serial_data_out_0 = HW_LDAC_SETTING_FST[15-bit_counter];  // Shift out MSB first
+                  bit_counter = bit_counter + 1;
+
+                end
+              end else begin
+                bit_counter <= 0;
+
+                CS <= 1;
+                ldac <= 0;
+                INIT_STATE <= SET_TX_DSPI;
+
+              end
+            end
+
+            
+
+
+            SET_TX_DSPI: begin
+
+              CS   <= 0;  // Assert SPI Chip Select
+              ldac <= 1;
+              if (bit_counter < 16) begin
+                if (!CS) begin
+                  serial_data_out_0 = INTERFACE_CONFIG_TX_DSPI[15-bit_counter];  // Shift out MSB first
+                  bit_counter = bit_counter + 1;
+
+                end
+              end else begin
+                CS <= 1;
+                bit_counter <= 0;
+
+                ldac <= 0;
+                INIT_STATE <= SET_STREAM_MODE;
+
+              end
+            end
+
+
+
+
+
+            SET_STREAM_MODE: begin
+
+              begin
+                CS   <= 0;
+                ldac <= 1;
+                if (bit_counter_data < 16) begin
+                  if (!CS) begin
+                    serial_data_out_0 <= INTERFACE_CONFIG_B_STREAM[15-bit_counter_data];  // Shift out MSB first
+                    // serial_data_out_1 <= INTERFACE_CONFIG_D_D1[15-bit_counter_data];  // Set DDR Mode using Dual Channel
+                    bit_counter_data <= bit_counter_data + 1;
+
+                  end
+                end else begin
+                  bit_counter_data <= 0;
+
+                  CS <= 1;
+                  ldac <= 0;
+                  INIT_STATE <= SET_DDR;
+
+                end
+              end
+
+
+            end
+
+       
+       
+
+            SET_DDR: begin
+
+              begin
+                CS   <= 0;
+                ldac <= 1;
+                if (bit_counter_data < 16) begin
+                  if (!CS) begin
+                    serial_data_out_0 <= INTERFACE_CONFIG_D_DDR[15-bit_counter_data];  // Shift out MSB first
+                    // serial_data_out_1 <= INTERFACE_CONFIG_D_D1[15-bit_counter_data];  // Set DDR Mode using Dual Channel
+                    bit_counter_data <= bit_counter_data + 1;
+
+                  end
+                end else begin
+                  bit_counter_data <= 0;
+
+                  CS <= 1;
+                  ldac <= 0;
+                  INIT_STATE <= INIT_COMPLETED;
+
+                end
+              end
+
+
+            end
+
+
+
+
+            INIT_COMPLETED: begin
+              state <= READY;
+              ldac  <= 1;
+            end
+          endcase
+          // END OF DAC INITIALIZATION      
+        end
+
+
+
+
+        READY: begin
+          ldac <= 1;
+          if (wait_c == 1) begin
+
+            state  <= STREAM_DATA;
+            ST_Sel <= 1'b1;
+          end else wait_c = wait_c + 1;
+
+        end
+
+
+      endcase
+    end
+  end
+
+
+
+  always @(negedge sysclk) begin
+
+    case (state)
+      STREAM_DATA: begin
+
+        CS_S <= 0;
+
+            if ((counter == 16'd0) || (counter == 16'd1) || (counter == 16'd2)) begin
+                ldac_S <= 1;
+            end
+
+            if (counter == 16'd3) begin
+                ldac_S <= 1;
+            end
+
+            case (counter)
+               
+                16'd1: begin   // Make LDAC high, need not pull LDAC low in stream mode for 2A
+                 ldac_S <=1;
+                end
+                
+                16'd4: begin
+                    serial_data_out_0_S = DDR_CHECK_FRAME1[15];
+                    serial_data_out_1_S = DDR_CHECK_FRAME2[15];
+                end
+                
+                16'd8: begin
+                    serial_data_out_0_S = DDR_CHECK_FRAME1[14];
+                    serial_data_out_1_S = DDR_CHECK_FRAME2[14];
+                end
+                
+                16'd12: begin
+                    serial_data_out_0_S = DDR_CHECK_FRAME1[13];
+                    serial_data_out_1_S = DDR_CHECK_FRAME2[13];
+                end
+                
+                16'd16: begin
+                    serial_data_out_0_S = DDR_CHECK_FRAME1[12];
+                    serial_data_out_1_S = DDR_CHECK_FRAME2[12];
+                end
+                
+                16'd20: begin
+                    serial_data_out_0_S = DDR_CHECK_FRAME1[11];
+                    serial_data_out_1_S = DDR_CHECK_FRAME2[11];
+                end
+                
+                16'd24: begin
+                    serial_data_out_0_S = DDR_CHECK_FRAME1[10];
+                    serial_data_out_1_S = DDR_CHECK_FRAME2[10];
+                end
+                
+                16'd28: begin
+                    serial_data_out_0_S = DDR_CHECK_FRAME1[9];
+                    serial_data_out_1_S = DDR_CHECK_FRAME2[9];
+                end
+                
+                16'd32: begin
+                    serial_data_out_0_S = DDR_CHECK_FRAME1[8];
+                    serial_data_out_1_S = DDR_CHECK_FRAME2[8];
+                end
+                
+                16'd36: begin
+                    serial_data_out_0_S = DDR_CHECK_FRAME1[7];
+                    serial_data_out_1_S = DDR_CHECK_FRAME2[7];
+                end
+                
+                16'd39: begin
+                    serial_data_out_0_S = DDR_CHECK_FRAME1[6];
+                    serial_data_out_1_S = DDR_CHECK_FRAME2[6];
+                    update_d = ~update_d;                              // Update_d toggles to zero here, and after the data trasaction counter reaches 54
+                end
+                
+                16'd41: begin
+                    serial_data_out_0_S = DDR_CHECK_FRAME1[5];
+                    serial_data_out_1_S = DDR_CHECK_FRAME2[5];
+                end
+                
+                16'd43: begin
+                    serial_data_out_0_S = DDR_CHECK_FRAME1[4];
+                    serial_data_out_1_S = DDR_CHECK_FRAME2[4];
+                end
+                
+                16'd45: begin
+                    serial_data_out_0_S = DDR_CHECK_FRAME1[3];
+                    serial_data_out_1_S = DDR_CHECK_FRAME2[3];
+                end
+                
+                16'd47: begin
+                    serial_data_out_0_S = DDR_CHECK_FRAME1[2];
+                    serial_data_out_1_S = DDR_CHECK_FRAME2[2];
+                end
+                
+                16'd49: begin
+                    serial_data_out_0_S = DDR_CHECK_FRAME1[1];
+                    serial_data_out_1_S = DDR_CHECK_FRAME2[1];
+                end
+                
+                16'd51: begin
+                    serial_data_out_0_S = DDR_CHECK_FRAME1[0];
+                    serial_data_out_1_S = DDR_CHECK_FRAME2[0];
+                end
+                
+                16'd52: begin
+                    update_d = ~update_d;  // Toggles to 1, this triggers the update of input data for waveform. New input data get updated after the entire 16 bits is sent
+                    
+                end
+                
+                16'd53: begin
+                    serial_data_out_0_S = DDR_CHECK_FRAME1[7];  // Send first MSB bit 
+                    serial_data_out_1_S = DDR_CHECK_FRAME2[7];
+                end
+                
+                16'd54: begin
+                    counter <= 16'd39;  // Loop back to second MSB bit
+                end
+                
+                
+            endcase
+
+            counter = counter + 1;
+        end
+    endcase
+end
+
+
+
+  always @(negedge sysclk_spi) begin
+    CS_d <= ((ST_Sel) ? CS_S : CS);
+
+  end
+
+  always @(*) CS_out <= CS_d | ((ST_Sel) ? CS_S : CS);
+
+
+  always @(*) begin
+    ldac_port = (ST_Sel) ? ldac_S : ldac;
+  end
+
+  assign serial_data_out_0_port = (ST_Sel) ? serial_data_out_0_S : serial_data_out_0;
+  assign serial_data_out_1_port = (ST_Sel) ? serial_data_out_1_S : serial_data_out_1;
+
+endmodule
